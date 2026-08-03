@@ -1,0 +1,19 @@
+# Render Blueprint. In Render: New > Blueprint > pick this repo.
+# Or configure the same values manually in a Web Service.
+services:
+  - type: web
+    name: borderless-backend
+    runtime: node
+    plan: free
+    # --include=dev so TypeScript is available at build time (NODE_ENV=production skips devDeps otherwise).
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+    # PORT is provided by Render automatically — do not set it.
