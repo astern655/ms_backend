@@ -3,12 +3,14 @@ import express from 'express'
 import cors from 'cors'
 import { AccessToken } from 'livekit-server-sdk'
 import { transcribeAndTranslate } from './stt.js'
+import { reindexGroup, askGroup } from './rag.js'
 
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, OPENAI_API_KEY } = process.env
 const PORT = Number(process.env.PORT ?? 3001)
 
 const app = express()
 app.use(cors())
+app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true })
@@ -52,6 +54,43 @@ app.post('/api/stt', express.raw({ type: '*/*', limit: '25mb' }), async (req, re
       apiKey: OPENAI_API_KEY,
     })
     res.json(out)
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// Rebuild the knowledge-base index for a group's docs.
+app.post('/api/rag/reindex', async (req, res) => {
+  const groupId = String(req.query.group ?? (req.body?.groupId as string) ?? '')
+  if (!groupId) {
+    res.status(400).json({ error: 'group required' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(await reindexGroup(groupId, OPENAI_API_KEY))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// Ask a question grounded in the group's docs.
+app.post('/api/rag/ask', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  const question = String(req.body?.question ?? '').trim()
+  if (!groupId || !question) {
+    res.status(400).json({ error: 'groupId and question required' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(await askGroup(groupId, question, OPENAI_API_KEY))
   } catch (e) {
     res.status(500).json({ error: (e as Error).message })
   }
