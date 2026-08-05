@@ -100,42 +100,151 @@ export async function reindexGroup(
 
 type ChunkRow = { source: string; content: string; embedding: string }
 
-// Answer a question grounded in the group's indexed docs.
-export async function askGroup(
+// Retrieve the top-k doc chunks for a question as a context string + source list.
+async function retrieve(
   groupId: string,
   question: string,
-  apiKey: string,
-): Promise<{ answer: string; sources: string[] }> {
-  const openai = new OpenAI({ apiKey })
+  openai: OpenAI,
+): Promise<{ context: string; sources: string[] }> {
   const { data, error } = await db()
     .from('doc_chunks')
     .select('source, content, embedding')
     .eq('group_id', groupId)
   if (error) throw new Error(error.message)
   const chunks = (data ?? []) as ChunkRow[]
-  if (chunks.length === 0) {
-    return { answer: '아직 색인된 문서가 없습니다. 먼저 "다시 색인"을 눌러주세요.', sources: [] }
-  }
+  if (chunks.length === 0) return { context: '', sources: [] }
 
   const [qv] = await embed(openai, [question])
   const scored = chunks
     .map((c) => ({ c, s: cosine(qv, JSON.parse(c.embedding) as number[]) }))
     .sort((a, b) => b.s - a.s)
     .slice(0, TOP_K)
+  return {
+    context: scored.map((x, i) => `[${i + 1}] (${x.c.source}) ${x.c.content}`).join('\n\n'),
+    sources: [...new Set(scored.map((x) => x.c.source))],
+  }
+}
 
-  const context = scored.map((x, i) => `[${i + 1}] (${x.c.source}) ${x.c.content}`).join('\n\n')
-  const r = await openai.chat.completions.create({
+// ---- Agent (one per group) + session (one per team) ----
+
+export type AgentSkills = {
+  docs_rag: boolean
+  summarize: boolean
+  action_items: boolean
+  translate: boolean
+}
+export type Agent = { group_id: string; name: string; system_prompt: string; skills: AgentSkills }
+
+const DEFAULT_SKILLS: AgentSkills = {
+  docs_rag: true,
+  summarize: true,
+  action_items: false,
+  translate: false,
+}
+const SKILL_PROMPTS: Record<keyof AgentSkills, string> = {
+  docs_rag: '- 팀의 문서·회의 기록(참고 자료)을 근거로 답하고, 없으면 모른다고 말해라.',
+  summarize: '- 요청 시 핵심을 간결한 불릿으로 요약해라.',
+  action_items: '- 대화·문서에 할 일이 있으면 "액션 아이템" 목록으로 정리해라.',
+  translate: '- 사용자가 특정 언어를 요청하면 그 언어로 번역해 제공해라.',
+}
+
+export async function getAgent(groupId: string): Promise<Agent> {
+  const { data, error } = await db()
+    .from('group_agents')
+    .select('*')
+    .eq('group_id', groupId)
+    .maybeSingle()
+  if (error) throw new Error(error.message)
+  if (data) return data as Agent
+  return { group_id: groupId, name: '팀 에이전트', system_prompt: '', skills: DEFAULT_SKILLS }
+}
+
+export async function saveAgent(
+  groupId: string,
+  fields: { name?: string; system_prompt?: string; skills?: AgentSkills },
+): Promise<void> {
+  const { error } = await db()
+    .from('group_agents')
+    .upsert({ group_id: groupId, ...fields, updated_at: new Date().toISOString() })
+  if (error) throw new Error(error.message)
+}
+
+type SessionMsg = { role: 'user' | 'ai'; content: string; sources: string[] | null; ts: string }
+
+// Agent config + a team's session history in one call.
+export async function loadAgentView(
+  groupId: string,
+  teamId: string | null,
+): Promise<{ agent: Agent; messages: SessionMsg[] }> {
+  const agent = await getAgent(groupId)
+  let messages: SessionMsg[] = []
+  if (teamId) {
+    const { data, error } = await db()
+      .from('agent_messages')
+      .select('role, content, sources, ts')
+      .eq('team_id', teamId)
+      .order('ts', { ascending: true })
+      .limit(50)
+    if (error) throw new Error(error.message)
+    messages = (data ?? []) as SessionMsg[]
+  }
+  return { agent, messages }
+}
+
+// Answer as the group's agent, within a team's session (persisted if teamId given).
+export async function askAgent(
+  opts: { groupId: string; teamId: string | null; question: string; apiKey: string },
+): Promise<{ answer: string; sources: string[] }> {
+  const { groupId, teamId, question, apiKey } = opts
+  const openai = new OpenAI({ apiKey })
+  const agent = await getAgent(groupId)
+  const skills = agent.skills ?? DEFAULT_SKILLS
+
+  const history: { role: 'user' | 'assistant'; content: string }[] = []
+  if (teamId) {
+    const { data } = await db()
+      .from('agent_messages')
+      .select('role, content')
+      .eq('team_id', teamId)
+      .order('ts', { ascending: true })
+      .limit(20)
+    for (const m of data ?? [])
+      history.push({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content as string })
+  }
+
+  let context = ''
+  let sources: string[] = []
+  if (skills.docs_rag) {
+    const r = await retrieve(groupId, question, openai)
+    context = r.context
+    sources = r.sources
+  }
+
+  const skillLines = (Object.keys(SKILL_PROMPTS) as (keyof AgentSkills)[])
+    .filter((k) => skills[k])
+    .map((k) => SKILL_PROMPTS[k])
+  const system = [
+    `너는 "${agent.name}"라는 팀 협업 AI 에이전트다. 사용자의 언어로 간결하고 정확하게 답해라.`,
+    agent.system_prompt?.trim() ? `역할: ${agent.system_prompt.trim()}` : '',
+    ...skillLines,
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  const userContent = context ? `참고 자료:\n${context}\n\n질문: ${question}` : question
+  const res = await openai.chat.completions.create({
     model: CHAT_MODEL,
-    messages: [
-      {
-        role: 'system',
-        content:
-          '너는 팀의 회의·문서 기록을 기반으로 답하는 어시스턴트다. 아래 컨텍스트만 근거로, 사용자의 언어로 간결히 답해라. 컨텍스트에 없으면 모른다고 말해라.',
-      },
-      { role: 'user', content: `컨텍스트:\n${context}\n\n질문: ${question}` },
-    ],
+    messages: [{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }],
   })
-  const answer = r.choices[0]?.message?.content?.trim() ?? ''
-  const sources = [...new Set(scored.map((x) => x.c.source))]
+  const answer = res.choices[0]?.message?.content?.trim() ?? ''
+
+  if (teamId) {
+    await db()
+      .from('agent_messages')
+      .insert([
+        { team_id: teamId, group_id: groupId, role: 'user', content: question },
+        { team_id: teamId, group_id: groupId, role: 'ai', content: answer, sources },
+      ])
+  }
   return { answer, sources }
 }
