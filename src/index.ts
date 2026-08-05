@@ -3,7 +3,7 @@ import express from 'express'
 import cors from 'cors'
 import { AccessToken } from 'livekit-server-sdk'
 import { transcribeAndTranslate } from './stt.js'
-import { reindexGroup, askAgent, saveAgent, loadAgentView } from './rag.js'
+import { reindexGroup, askGroup, runAgent, type AgentMode } from './rag.js'
 
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, OPENAI_API_KEY } = process.env
 const PORT = Number(process.env.PORT ?? 3001)
@@ -77,44 +77,9 @@ app.post('/api/rag/reindex', async (req, res) => {
   }
 })
 
-// Agent config (per group) + a team's session history.
-app.get('/api/agent', async (req, res) => {
-  const groupId = String(req.query.group ?? '')
-  const teamId = req.query.team ? String(req.query.team) : null
-  if (!groupId) {
-    res.status(400).json({ error: 'group required' })
-    return
-  }
-  try {
-    res.json(await loadAgentView(groupId, teamId))
-  } catch (e) {
-    res.status(500).json({ error: (e as Error).message })
-  }
-})
-
-// Save the group's agent config (name / skills).
-app.post('/api/agent/config', async (req, res) => {
+// Chatbot: lightweight RAG Q&A.
+app.post('/api/rag/ask', async (req, res) => {
   const groupId = String(req.body?.groupId ?? '')
-  if (!groupId) {
-    res.status(400).json({ error: 'groupId required' })
-    return
-  }
-  try {
-    await saveAgent(groupId, {
-      name: req.body?.name,
-      system_prompt: req.body?.systemPrompt,
-      skills: req.body?.skills,
-    })
-    res.json({ ok: true })
-  } catch (e) {
-    res.status(500).json({ error: (e as Error).message })
-  }
-})
-
-// Ask the group's agent within a team session (persisted if teamId given).
-app.post('/api/agent/ask', async (req, res) => {
-  const groupId = String(req.body?.groupId ?? '')
-  const teamId = req.body?.teamId ? String(req.body.teamId) : null
   const question = String(req.body?.question ?? '').trim()
   if (!groupId || !question) {
     res.status(400).json({ error: 'groupId and question required' })
@@ -125,7 +90,27 @@ app.post('/api/agent/ask', async (req, res) => {
     return
   }
   try {
-    res.json(await askAgent({ groupId, teamId, question, apiKey: OPENAI_API_KEY }))
+    res.json(await askGroup(groupId, question, OPENAI_API_KEY))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// Agent: generate a deliverable (PRD / report / plan / design / dev) from records + direction.
+app.post('/api/agent/run', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  const mode = String(req.body?.mode ?? '') as AgentMode
+  const direction = String(req.body?.direction ?? '').trim()
+  if (!groupId || !mode) {
+    res.status(400).json({ error: 'groupId and mode required' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(await runAgent({ groupId, mode, direction, apiKey: OPENAI_API_KEY }))
   } catch (e) {
     res.status(500).json({ error: (e as Error).message })
   }

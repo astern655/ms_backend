@@ -125,126 +125,100 @@ async function retrieve(
   }
 }
 
-// ---- Agent (one per group) + session (one per team) ----
+// ---- Chatbot: lightweight, stateless RAG Q&A (low-level, token-cheap) ----
 
-export type AgentSkills = {
-  docs_rag: boolean
-  summarize: boolean
-  action_items: boolean
-  translate: boolean
-}
-export type Agent = { group_id: string; name: string; system_prompt: string; skills: AgentSkills }
-
-const DEFAULT_SKILLS: AgentSkills = {
-  docs_rag: true,
-  summarize: true,
-  action_items: false,
-  translate: false,
-}
-const SKILL_PROMPTS: Record<keyof AgentSkills, string> = {
-  docs_rag: '- 팀의 문서·회의 기록(참고 자료)을 근거로 답하고, 없으면 모른다고 말해라.',
-  summarize: '- 요청 시 핵심을 간결한 불릿으로 요약해라.',
-  action_items: '- 대화·문서에 할 일이 있으면 "액션 아이템" 목록으로 정리해라.',
-  translate: '- 사용자가 특정 언어를 요청하면 그 언어로 번역해 제공해라.',
-}
-
-export async function getAgent(groupId: string): Promise<Agent> {
-  const { data, error } = await db()
-    .from('group_agents')
-    .select('*')
-    .eq('group_id', groupId)
-    .maybeSingle()
-  if (error) throw new Error(error.message)
-  if (data) return data as Agent
-  return { group_id: groupId, name: '팀 에이전트', system_prompt: '', skills: DEFAULT_SKILLS }
-}
-
-export async function saveAgent(
+export async function askGroup(
   groupId: string,
-  fields: { name?: string; system_prompt?: string; skills?: AgentSkills },
-): Promise<void> {
-  const { error } = await db()
-    .from('group_agents')
-    .upsert({ group_id: groupId, ...fields, updated_at: new Date().toISOString() })
-  if (error) throw new Error(error.message)
-}
-
-type SessionMsg = { role: 'user' | 'ai'; content: string; sources: string[] | null; ts: string }
-
-// Agent config + a team's session history in one call.
-export async function loadAgentView(
-  groupId: string,
-  teamId: string | null,
-): Promise<{ agent: Agent; messages: SessionMsg[] }> {
-  const agent = await getAgent(groupId)
-  let messages: SessionMsg[] = []
-  if (teamId) {
-    const { data, error } = await db()
-      .from('agent_messages')
-      .select('role, content, sources, ts')
-      .eq('team_id', teamId)
-      .order('ts', { ascending: true })
-      .limit(50)
-    if (error) throw new Error(error.message)
-    messages = (data ?? []) as SessionMsg[]
-  }
-  return { agent, messages }
-}
-
-// Answer as the group's agent, within a team's session (persisted if teamId given).
-export async function askAgent(
-  opts: { groupId: string; teamId: string | null; question: string; apiKey: string },
+  question: string,
+  apiKey: string,
 ): Promise<{ answer: string; sources: string[] }> {
-  const { groupId, teamId, question, apiKey } = opts
   const openai = new OpenAI({ apiKey })
-  const agent = await getAgent(groupId)
-  const skills = agent.skills ?? DEFAULT_SKILLS
-
-  const history: { role: 'user' | 'assistant'; content: string }[] = []
-  if (teamId) {
-    const { data } = await db()
-      .from('agent_messages')
-      .select('role, content')
-      .eq('team_id', teamId)
-      .order('ts', { ascending: true })
-      .limit(20)
-    for (const m of data ?? [])
-      history.push({ role: m.role === 'ai' ? 'assistant' : 'user', content: m.content as string })
+  const { context, sources } = await retrieve(groupId, question, openai)
+  if (!context) {
+    return { answer: '아직 색인된 문서가 없습니다. 먼저 "다시 색인"을 눌러주세요.', sources: [] }
   }
-
-  let context = ''
-  let sources: string[] = []
-  if (skills.docs_rag) {
-    const r = await retrieve(groupId, question, openai)
-    context = r.context
-    sources = r.sources
-  }
-
-  const skillLines = (Object.keys(SKILL_PROMPTS) as (keyof AgentSkills)[])
-    .filter((k) => skills[k])
-    .map((k) => SKILL_PROMPTS[k])
-  const system = [
-    `너는 "${agent.name}"라는 팀 협업 AI 에이전트다. 사용자의 언어로 간결하고 정확하게 답해라.`,
-    agent.system_prompt?.trim() ? `역할: ${agent.system_prompt.trim()}` : '',
-    ...skillLines,
-  ]
-    .filter(Boolean)
-    .join('\n')
-
-  const userContent = context ? `참고 자료:\n${context}\n\n질문: ${question}` : question
   const res = await openai.chat.completions.create({
     model: CHAT_MODEL,
-    messages: [{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }],
+    messages: [
+      {
+        role: 'system',
+        content:
+          '너는 팀의 문서·회의 기록을 근거로 답하는 어시스턴트다. 아래 참고 자료만 근거로 사용자의 언어로 간결히 답하고, 없으면 모른다고 말해라.',
+      },
+      { role: 'user', content: `참고 자료:\n${context}\n\n질문: ${question}` },
+    ],
   })
-  const answer = res.choices[0]?.message?.content?.trim() ?? ''
+  return { answer: res.choices[0]?.message?.content?.trim() ?? '', sources }
+}
 
-  if (teamId) {
-    await db()
-      .from('agent_messages')
-      .insert([
-        { team_id: teamId, group_id: groupId, role: 'user', content: question },
-        { team_id: teamId, group_id: groupId, role: 'ai', content: answer, sources },
-      ])
-  }
-  return { answer, sources }
+// ---- Agent: higher-level deliverable generator (meeting/docs + direction → artifact) ----
+
+export type AgentMode = 'prd' | 'report' | 'plan' | 'design' | 'dev'
+
+const MODE_SPEC: Record<AgentMode, { label: string; guide: string }> = {
+  prd: {
+    label: 'PRD',
+    guide:
+      'PRD(제품 요구사항 문서)를 작성해라. 섹션: 배경/문제, 목표, 대상 사용자, 핵심 기능 요구사항, 범위(포함/제외), 성공 지표, 리스크.',
+  },
+  report: {
+    label: '보고서',
+    guide: '보고서를 작성해라. 섹션: 요약, 배경, 진행 상황, 주요 논의/결정, 이슈, 다음 단계.',
+  },
+  plan: {
+    label: '실행 계획',
+    guide:
+      '실행 계획을 작성해라. 섹션: 목표, 마일스톤, 작업 분해(WBS), 담당/역할(있으면), 일정, 의존성, 리스크.',
+  },
+  design: {
+    label: '디자인 방향서',
+    guide:
+      '디자인 방향서를 작성해라. 섹션: 컨셉/무드, 핵심 화면·컴포넌트, 정보 구조/플로우, 스타일(색·타이포·간격 가이드), 인터랙션.',
+  },
+  dev: {
+    label: '개발 계획/명세',
+    guide:
+      '개발 계획·기술 명세를 작성해라. 섹션: 아키텍처 개요, 데이터 모델, API/인터페이스, 작업 목록(구현 단계), 기술 스택, 테스트/검증.',
+  },
+}
+
+// Generate a deliverable grounded in the group's records + the user's direction.
+export async function runAgent(opts: {
+  groupId: string
+  mode: AgentMode
+  direction: string
+  apiKey: string
+}): Promise<{ title: string; content: string; sources: string[] }> {
+  const { groupId, mode, direction, apiKey } = opts
+  const spec = MODE_SPEC[mode]
+  if (!spec) throw new Error(`unknown mode: ${mode}`)
+  const openai = new OpenAI({ apiKey })
+
+  // Retrieve broad context: use the direction (or the mode label) as the query.
+  const { context, sources } = await retrieve(groupId, direction || spec.label, openai)
+
+  const system = [
+    '너는 팀의 회의·문서 기록과 사용자의 방향을 바탕으로 실무 산출물을 만드는 시니어 협업 에이전트다.',
+    spec.guide,
+    '한국어 마크다운으로 작성해라. 첫 줄은 반드시 "# 제목" 형식의 제목 한 줄이어야 한다.',
+    '참고 자료가 부족하면 합리적으로 가정하되, 가정은 "가정" 항목에 명시해라.',
+  ].join('\n')
+
+  const user = [
+    context ? `참고 자료(팀 기록):\n${context}` : '참고 자료: (색인된 기록 없음)',
+    `\n원하는 방향/목표:\n${direction || '(구체적 방향 미입력 — 기록을 바탕으로 합리적으로 작성)'}`,
+    `\n위 내용으로 ${spec.label} 산출물을 작성해라.`,
+  ].join('\n')
+
+  const res = await openai.chat.completions.create({
+    model: CHAT_MODEL,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  })
+  const content = res.choices[0]?.message?.content?.trim() ?? ''
+  const firstLine = content.split('\n')[0] ?? ''
+  const title = firstLine.replace(/^#+\s*/, '').trim() || `${spec.label} 산출물`
+  return { title, content, sources }
 }
