@@ -1,20 +1,10 @@
 import OpenAI from 'openai'
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { db } from '../lib/supabase.js'
 
 const EMBED_MODEL = 'text-embedding-3-small' // 1536 dims
 const CHAT_MODEL = 'gpt-4o-mini'
 const CHUNK_SIZE = 900 // chars per chunk
 const TOP_K = 6
-
-let _db: SupabaseClient | null = null
-function db(): SupabaseClient {
-  if (_db) return _db
-  const url = process.env.SUPABASE_URL
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!url || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set')
-  _db = createClient(url, key, { auth: { persistSession: false } })
-  return _db
-}
 
 // Pull readable text out of a doc's stored content (BlockNote JSON or plain text).
 function docText(content: string): string {
