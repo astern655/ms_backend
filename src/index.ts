@@ -3,7 +3,17 @@ import express from 'express'
 import cors from 'cors'
 import { AccessToken } from 'livekit-server-sdk'
 import { transcribeAndTranslate } from './stt.js'
-import { reindexGroup, askGroup, runAgent, type AgentMode } from './rag.js'
+import { seedDemoWorkspace } from './demo.js'
+import {
+  reindexGroup,
+  askGroup,
+  runAgent,
+  proposeExecutionPlan,
+  proceedAgent,
+  structureMeeting,
+  listAgentSkills,
+  type AgentMode,
+} from './rag.js'
 
 const { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, OPENAI_API_KEY } = process.env
 const PORT = Number(process.env.PORT ?? 3001)
@@ -96,11 +106,29 @@ app.post('/api/rag/ask', async (req, res) => {
   }
 })
 
-// Agent: generate a deliverable (PRD / report / plan / design / dev) from records + direction.
+app.get('/api/agent/skills', (_req, res) => {
+  res.json({ skills: listAgentSkills() })
+})
+
+app.post('/api/demo/seed', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  if (!groupId) {
+    res.status(400).json({ error: 'groupId required' })
+    return
+  }
+  try {
+    res.json(await seedDemoWorkspace(groupId))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// Agent: backward-compatible deliverable generation for the existing frontend.
 app.post('/api/agent/run', async (req, res) => {
   const groupId = String(req.body?.groupId ?? '')
-  const mode = String(req.body?.mode ?? '') as AgentMode
+  const mode = String(req.body?.mode ?? 'ppt_draft') as AgentMode
   const direction = String(req.body?.direction ?? '').trim()
+  const meetingTranscript = String(req.body?.meetingTranscript ?? '').trim()
   if (!groupId || !mode) {
     res.status(400).json({ error: 'groupId and mode required' })
     return
@@ -110,7 +138,83 @@ app.post('/api/agent/run', async (req, res) => {
     return
   }
   try {
-    res.json(await runAgent({ groupId, mode, direction, apiKey: OPENAI_API_KEY }))
+    res.json(await runAgent({ groupId, mode, direction, meetingTranscript, apiKey: OPENAI_API_KEY }))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// P0 step 1: structure meeting records and propose an execution plan. No external work is executed.
+app.post('/api/agent/plan', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  const direction = String(req.body?.direction ?? '').trim()
+  const meetingTranscript = String(req.body?.meetingTranscript ?? '').trim()
+  if (!groupId) {
+    res.status(400).json({ error: 'groupId required' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(await proposeExecutionPlan({ groupId, direction, meetingTranscript, apiKey: OPENAI_API_KEY }))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// P0 structured extraction: machine-readable decisions, owners, deadlines, and requested artifacts.
+app.post('/api/meetings/structure', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  const direction = String(req.body?.direction ?? '').trim()
+  const meetingTranscript = String(req.body?.meetingTranscript ?? '').trim()
+  if (!groupId || !meetingTranscript) {
+    res.status(400).json({ error: 'groupId and meetingTranscript required' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(await structureMeeting({ groupId, direction, meetingTranscript, apiKey: OPENAI_API_KEY }))
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message })
+  }
+})
+
+// P0 step 2: after explicit approval, generate the representative production artifact.
+app.post('/api/agent/proceed', async (req, res) => {
+  const groupId = String(req.body?.groupId ?? '')
+  const approved = req.body?.approved === true || String(req.body?.approval ?? '').toLowerCase() === 'proceed'
+  const mode = String(req.body?.mode ?? 'ppt_draft') as AgentMode
+  const direction = String(req.body?.direction ?? '').trim()
+  const meetingTranscript = String(req.body?.meetingTranscript ?? '').trim()
+  const executionPlan = String(req.body?.executionPlan ?? '').trim()
+  if (!groupId) {
+    res.status(400).json({ error: 'groupId required' })
+    return
+  }
+  if (!approved) {
+    res.status(400).json({ error: 'approval required: pass approved=true or approval="proceed"' })
+    return
+  }
+  if (!OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY not set' })
+    return
+  }
+  try {
+    res.json(
+      await proceedAgent({
+        groupId,
+        mode,
+        direction,
+        meetingTranscript,
+        executionPlan,
+        apiKey: OPENAI_API_KEY,
+      }),
+    )
   } catch (e) {
     res.status(500).json({ error: (e as Error).message })
   }
