@@ -123,6 +123,15 @@ create policy dv_insert on public.doc_versions for insert with check (
 
 -- ---- 6. 대기실/자동승인(7) ----
 alter table public.teams add column if not exists auto_approve boolean not null default true;
+-- 대표/팀장이 팀 설정(대기실 auto_approve 등)을 변경할 수 있도록 UPDATE 정책 추가(가산적).
+drop policy if exists teams_host_update on public.teams;
+create policy teams_host_update on public.teams for update using (
+  exists(select 1 from public.groups g where g.id = teams.group_id and g.owner_id = auth.uid())
+  or exists(select 1 from public.team_members tm where tm.team_id = teams.id and tm.user_id = auth.uid() and tm.role = 'lead')
+) with check (
+  exists(select 1 from public.groups g where g.id = teams.group_id and g.owner_id = auth.uid())
+  or exists(select 1 from public.team_members tm where tm.team_id = teams.id and tm.user_id = auth.uid() and tm.role = 'lead')
+);
 create table if not exists public.meeting_requests (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references public.teams(id) on delete cascade,
