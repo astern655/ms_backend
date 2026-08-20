@@ -233,7 +233,30 @@ create policy dimg_read on storage.objects for select using (bucket_id = 'doc-im
 drop policy if exists dimg_write on storage.objects;
 create policy dimg_write on storage.objects for insert to authenticated with check (bucket_id = 'doc-images');
 
--- ---- 12. 에이전트 기능 제거 — 관련 테이블 삭제 ----
+-- ---- 12. 문서 동시편집(32) — Yjs 업데이트 로그(postgres_changes 전송) ----
+create table if not exists public.doc_yjs (
+  id bigint generated always as identity primary key,
+  doc_id uuid not null,
+  group_id uuid not null references public.groups(id) on delete cascade,
+  update_b64 text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists doc_yjs_doc on public.doc_yjs(doc_id, id);
+alter table public.doc_yjs enable row level security;
+drop policy if exists dy_read on public.doc_yjs;
+create policy dy_read on public.doc_yjs for select using (
+  exists(select 1 from public.group_members gm where gm.group_id = doc_yjs.group_id and gm.user_id = auth.uid())
+);
+drop policy if exists dy_insert on public.doc_yjs;
+create policy dy_insert on public.doc_yjs for insert with check (
+  exists(select 1 from public.group_members gm where gm.group_id = doc_yjs.group_id and gm.user_id = auth.uid())
+);
+do $$
+begin
+  alter publication supabase_realtime add table public.doc_yjs;
+exception when others then null; end $$;
+
+-- ---- 13. 에이전트 기능 제거 — 관련 테이블 삭제 ----
 -- 에이전트(산출물 생성기)는 서버 사양 제약으로 스코프에서 제외됨.
 -- 남아있던 상태 테이블을 정리한다. (지식 어시스턴트 챗봇은 별개 기능으로 유지)
 drop table if exists public.agent_messages cascade;
