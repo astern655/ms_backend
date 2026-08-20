@@ -232,3 +232,9 @@ drop policy if exists dimg_read on storage.objects;
 create policy dimg_read on storage.objects for select using (bucket_id = 'doc-images');
 drop policy if exists dimg_write on storage.objects;
 create policy dimg_write on storage.objects for insert to authenticated with check (bucket_id = 'doc-images');
+
+-- ---- 12. 에이전트 기능 제거 — 관련 테이블 삭제 ----
+-- 에이전트(산출물 생성기)는 서버 사양 제약으로 스코프에서 제외됨.
+-- 남아있던 상태 테이블을 정리한다. (지식 어시스턴트 챗봇은 별개 기능으로 유지)
+drop table if exists public.agent_messages cascade;
+drop table if exists public.group_agents cascade;
